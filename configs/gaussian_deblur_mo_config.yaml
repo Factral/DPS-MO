@@ -1,0 +1,22 @@
+data:
+  name: ffhq
+  root: '/ibex/user/perezpnf/ffhq-dataset/images256x256'
+  
+measurement:
+  operator:
+    name: gaussian_blur
+    kernel_size: 61
+    intensity: 3.0
+  noise:
+    name: gaussian
+    sigma: 0.05
+
+conditioning:
+  method: ps
+  params:
+    scale: 1.0
+
+mo_optimization:  # Measurement Optimization settings
+  use_mo: True     # Enable MO for this task
+  N_sgld_steps: 50  # Number of SGLD steps per diffusion timestep
+  sgld_lr: 5.0e-5   # Learning rate for SGLD optimization 

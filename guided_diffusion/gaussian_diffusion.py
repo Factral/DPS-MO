@@ -36,21 +36,29 @@ def create_sampler(sampler,
                    dynamic_threshold,
                    clip_denoised,
                    rescale_timesteps,
-                   timestep_respacing=""):
+                   timestep_respacing="",
+                   ddim_eta=0.0):
     
-    sampler = get_sampler(name=sampler)
+    sampler_name = sampler # Store the name
+    sampler = get_sampler(name=sampler_name)
     
     betas = get_named_beta_schedule(noise_schedule, steps)
     if not timestep_respacing:
         timestep_respacing = [steps]
          
-    return sampler(use_timesteps=space_timesteps(steps, timestep_respacing),
-                   betas=betas,
-                   model_mean_type=model_mean_type,
-                   model_var_type=model_var_type,
-                   dynamic_threshold=dynamic_threshold,
-                   clip_denoised=clip_denoised, 
-                   rescale_timesteps=rescale_timesteps)
+    sampler_kwargs = {
+        'use_timesteps': space_timesteps(steps, timestep_respacing),
+        'betas': betas,
+        'model_mean_type': model_mean_type,
+        'model_var_type': model_var_type,
+        'dynamic_threshold': dynamic_threshold,
+        'clip_denoised': clip_denoised, 
+        'rescale_timesteps': rescale_timesteps
+    }
+    if sampler_name == 'ddim':
+        sampler_kwargs['eta'] = ddim_eta
+         
+    return sampler(**sampler_kwargs)
 
 
 class GaussianDiffusion:
@@ -126,7 +134,7 @@ class GaussianDiffusion:
 
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t):
+    def q_sample(self, x_start, t, noise=None):
         """
         Diffuse the data for a given number of diffusion steps.
 
@@ -137,7 +145,8 @@ class GaussianDiffusion:
         :param noise: if specified, the split-out normal noise.
         :return: A noisy version of x_start.
         """
-        noise = torch.randn_like(x_start)
+        if noise is None:
+            noise = torch.randn_like(x_start)
         assert noise.shape == x_start.shape
         
         coef1 = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start)
@@ -172,8 +181,11 @@ class GaussianDiffusion:
                       x_start,
                       measurement,
                       measurement_cond_fn,
-                      record,
-                      save_root):
+                      record=False,
+                      save_root=None,
+                      mo_optimizer_instance=None,
+                      operator=None
+                      ):
         """
         The function used for sampling from noise.
         """ 
@@ -181,29 +193,72 @@ class GaussianDiffusion:
         device = x_start.device
 
         pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        
         for idx in pbar:
             time = torch.tensor([idx] * img.shape[0], device=device)
             
-            img = img.requires_grad_()
-            out = self.p_sample(x=img, t=time, model=model)
-            
-            # Give condition.
-            noisy_measurement = self.q_sample(measurement, t=time)
+            img_for_model_pass = img.detach().clone().requires_grad_(True)
 
-            # TODO: how can we handle argument for different condition method?
-            img, distance = measurement_cond_fn(x_t=out['sample'],
+            initial_out_dict = self.p_mean_variance(model, img_for_model_pass, time)
+            # This is x0 from UNet, with grad connection to img_for_model_pass.
+            # It's ALWAYS used by measurement_cond_fn for its gradient calculation.
+            unet_pred_xstart_for_dps_grad = initial_out_dict['pred_xstart']
+            
+            # This x0 is used for the sampling step _get_sample_from_x0_hat.
+            # Starts as UNet's prediction, potentially replaced by MO's output.
+            x0_hat_for_sampling_step = unet_pred_xstart_for_dps_grad 
+
+            sgld_distance_metric = torch.tensor(0.0, device=device) 
+            dps_cond_distance_metric = torch.tensor(0.0, device=device)
+
+            if mo_optimizer_instance is not None:
+                # MO uses a detached version of UNet's prediction as x_init.
+                x_init_for_mo = unet_pred_xstart_for_dps_grad.detach().clone()
+                refined_x0_hat_from_mo, sgld_loss = mo_optimizer_instance.run(
+                    denoiser_model=model,
+                    y_measurement=measurement,
+                    x_init=x_init_for_mo,
+                    current_t_tensor=time,
+                    diffusion_sampler=self 
+                )
+                # MO's output is used for the sampling step.
+                x0_hat_for_sampling_step = refined_x0_hat_from_mo
+                sgld_distance_metric = torch.tensor(sgld_loss, device=device)
+
+            # Compute x_{t-1} sample using the (potentially MO-refined) x0_hat_for_sampling_step.
+            sample_next_xt = self._get_sample_from_x0_hat(
+                current_x_t=img, # Original x_t for this step
+                t=time,
+                pred_x0_hat=x0_hat_for_sampling_step, # UNet output or MO output
+                model_var_input=initial_out_dict['model_var_input'] # From initial UNet pass
+            )
+            
+            # For conditioning, pred_xstart MUST have a gradient path to x_prev (img_for_model_pass).
+            out_for_cond_fn = {
+                'sample': sample_next_xt.detach().clone(), # x_{t-1} before DPS gradient adjustment
+                'pred_xstart': unet_pred_xstart_for_dps_grad # UNet's direct output with grad
+            }
+
+            noisy_measurement = self.q_sample(measurement, t=time)
+            img_conditioned, dps_cond_norm = measurement_cond_fn(
+                x_t=out_for_cond_fn['sample'],
                                       measurement=measurement,
                                       noisy_measurement=noisy_measurement,
-                                      x_prev=img,
-                                      x_0_hat=out['pred_xstart'])
-            img = img.detach_()
-           
-            pbar.set_postfix({'distance': distance.item()}, refresh=False)
-            if record:
-                if idx % 10 == 0:
-                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                    plt.imsave(file_path, clear_color(img))
+                x_prev=img_for_model_pass, # x_t (current, with grad)
+                x_0_hat=out_for_cond_fn['pred_xstart'] # x_0_theta(x_t) (from UNet, with grad w.r.t. x_prev)
+            )
+            img = img_conditioned.detach_()
+            dps_cond_distance_metric = dps_cond_norm
 
+            log_dict = {}
+            if mo_optimizer_instance is not None:
+                log_dict['SGLDloss'] = sgld_distance_metric.item()
+            log_dict['DPSnorm'] = dps_cond_distance_metric.item()
+            pbar.set_postfix(log_dict, refresh=False)
+
+            if record and save_root is not None:
+                if idx % 10 == 0 or idx == (self.num_timesteps -1) or idx == 0 :
+                    plt.imsave(os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png"), clear_color(img))
         return img       
         
     def p_sample(self, model, x, t):
@@ -229,13 +284,21 @@ class GaussianDiffusion:
         return {'mean': model_mean,
                 'variance': model_variance,
                 'log_variance': model_log_variance,
-                'pred_xstart': pred_xstart}
+                'pred_xstart': pred_xstart,
+                'model_var_input': model_var_values}
 
     
     def _scale_timesteps(self, t):
         if self.rescale_timesteps:
             return t.float() * (1000.0 / self.num_timesteps)
         return t
+
+    def _get_sample_from_x0_hat(self, current_x_t, t, pred_x0_hat, model_var_input):
+        """
+        Abstract method to get x_{t-1} sample from current x_t and predicted x_0_hat.
+        This needs to be implemented by subclasses like DDPM and DDIM.
+        """
+        raise NotImplementedError("Sampler must implement _get_sample_from_x0_hat")
 
 def space_timesteps(num_timesteps, section_counts):
     """
@@ -367,14 +430,34 @@ class DDPM(SpacedDiffusion):
         sample = out['mean']
 
         noise = torch.randn_like(x)
-        if t != 0:  # no noise when t == 0
+        if t.item() != 0:  # no noise when t == 0
             sample += torch.exp(0.5 * out['log_variance']) * noise
 
         return {'sample': sample, 'pred_xstart': out['pred_xstart']}
     
+    def _get_sample_from_x0_hat(self, current_x_t, t, pred_x0_hat, model_var_input):
+        # Logic from original DDPM.p_sample, using the provided pred_x0_hat
+        mean_pred_from_final_x0 = self.mean_processor.q_posterior_mean(x_start=pred_x0_hat, x_t=current_x_t, t=t)
+        
+        # Variance uses model_var_input from the initial UNet call
+        model_variance, model_log_variance = self.var_processor.get_variance(model_var_input, t)
+        
+        sample = mean_pred_from_final_x0
+        noise = torch.randn_like(current_x_t, device=current_x_t.device)
+        
+        # Check if t is a tensor; if so, compare its element.
+        # Assuming t is a scalar tensor [idx]
+        if t.item() != 0:  # no noise when t == 0
+            sample += torch.exp(0.5 * model_log_variance) * noise
+        return sample.detach()
+    
 
 @register_sampler(name='ddim')
 class DDIM(SpacedDiffusion):
+    def __init__(self, use_timesteps, *, eta=0.0, **kwargs):
+        super().__init__(use_timesteps, **kwargs)
+        self.eta = eta
+
     def p_sample(self, model, x, t, eta=0.0):
         out = self.p_mean_variance(model, x, t)
         
@@ -395,10 +478,38 @@ class DDIM(SpacedDiffusion):
         )
 
         sample = mean_pred
-        if t != 0:
+        if t.item() != 0:
             sample += sigma * noise
         
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+    def _get_sample_from_x0_hat(self, current_x_t, t, pred_x0_hat, model_var_input, eta=None):
+        if eta is None:
+            eta = self.eta # Use instance's eta by default
+
+        # Logic from original DDIM.p_sample, using the provided pred_x0_hat
+        eps = self.predict_eps_from_x_start(x_t=current_x_t, t=t, pred_xstart=pred_x0_hat)
+        
+        alpha_bar = extract_and_expand(self.alphas_cumprod, t, current_x_t)
+        alpha_bar_prev = extract_and_expand(self.alphas_cumprod_prev, t, current_x_t)
+        
+        # Ensure non-zero denominator for sigma calculation
+        sigma_num = torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar).clamp(min=1e-9))
+        sigma_den = torch.sqrt(1 - alpha_bar / alpha_bar_prev.clamp(min=1e-9))
+        sigma = eta * sigma_num * sigma_den
+        
+        noise = torch.randn_like(current_x_t, device=current_x_t.device)
+        
+        mean_pred = (
+            pred_x0_hat * torch.sqrt(alpha_bar_prev)
+            + torch.sqrt((1 - alpha_bar_prev - sigma ** 2).clamp(min=0.0)) * eps
+        )
+
+        sample = mean_pred
+        if t.item() != 0:
+            sample += sigma * noise
+        
+        return sample.detach()
 
     def predict_eps_from_x_start(self, x_t, t, pred_xstart):
         coef1 = extract_and_expand(self.sqrt_recip_alphas_cumprod, t, x_t)

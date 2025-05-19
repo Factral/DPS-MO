@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.measurements import get_noise, get_operator
+from guided_diffusion.measurements_optimization import MeasurementOptimizer
 from guided_diffusion.unet import create_model
 from guided_diffusion.gaussian_diffusion import create_sampler
 from data.dataloader import get_dataset, get_dataloader
@@ -29,6 +30,10 @@ def main():
     parser.add_argument('--task_config', type=str)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./results')
+    parser.add_argument('--use_mo', type=lambda x: (str(x).lower() == 'true'), default=False, help="Whether to use Measurement Optimization")
+    parser.add_argument('--N_sgld_steps', type=int, default=50, help="Number of SGLD steps for MO")
+    parser.add_argument('--sgld_lr', type=float, default=5e-5, help="Learning rate for SGLD in MO")
+    parser.add_argument('--ddim_eta', type=float, default=0.0, help="Eta for DDIM sampler (0.0 is DDIM, 1.0 is DDPM-like noise)")
     args = parser.parse_args()
    
     # logger
@@ -64,9 +69,30 @@ def main():
     measurement_cond_fn = cond_method.conditioning
     logger.info(f"Conditioning method : {task_config['conditioning']['method']}")
    
+    # Prepare MO Optimizer if enabled
+    mo_optimizer_instance = None
+    if args.use_mo:
+        if task_config.get('mo_optimization', {}).get('use_mo', args.use_mo): # Prioritize task_config if exists
+            N_sgld_steps = task_config.get('mo_optimization', {}).get('N_sgld_steps', args.N_sgld_steps)
+            sgld_lr = task_config.get('mo_optimization', {}).get('sgld_lr', args.sgld_lr)
+            logger.info(f"Measurement Optimization enabled with N_sgld_steps={N_sgld_steps}, sgld_lr={sgld_lr}")
+            mo_optimizer_instance = MeasurementOptimizer(
+                operator_A=operator, # The problem's forward operator
+                N_sgld_steps=N_sgld_steps,
+                sgld_lr=sgld_lr,
+                device=device
+            )
+        else:
+            logger.info("Measurement Optimization specified by args but disabled in task_config or by use_mo flag.")
+   
     # Load diffusion sampler
-    sampler = create_sampler(**diffusion_config) 
-    sample_fn = partial(sampler.p_sample_loop, model=model, measurement_cond_fn=measurement_cond_fn)
+    sampler = create_sampler(**diffusion_config, ddim_eta=args.ddim_eta) # Pass ddim_eta
+    sample_fn = partial(sampler.p_sample_loop, 
+                        model=model, 
+                        measurement_cond_fn=measurement_cond_fn,
+                        mo_optimizer_instance=mo_optimizer_instance, # Pass MO instance
+                        operator=operator # Pass operator (already part of MO, but p_sample_loop might need it for other reasons)
+                        )
    
     # Working directory
     out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
